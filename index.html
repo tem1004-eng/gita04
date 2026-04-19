@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>악보 분석 및 조표 자동 이조 엔진 v3</title>
+    <style>
+        body {
+            font-family: 'Pretendard', sans-serif;
+            background-color: #1e1e24; /* 다크 모드 스타일로 변경 */
+            color: #fff;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            background: #2b2b36;
+            padding: 30px;
+            border-radius: 16px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.5);
+            width: 100%;
+            max-width: 700px;
+        }
+        h1 { text-align: center; color: #4facfe; margin-bottom: 20px; font-size: 1.6rem; }
+        
+        .controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 25px;
+            background: #3a3a48;
+            padding: 15px;
+            border-radius: 10px;
+        }
+        label { display: block; margin-bottom: 8px; font-size: 0.9rem; color: #aaa; }
+        select { 
+            width: 100%; padding: 10px; border: none; border-radius: 6px; 
+            background: #4a4a5a; color: white; font-size: 1rem; outline: none;
+        }
+
+        /* 시퀀서(악보) UI */
+        .sequencer {
+            margin-bottom: 20px;
+            overflow-x: auto;
+            background: #222;
+            padding: 15px;
+            border-radius: 10px;
+        }
+        .track { display: flex; margin-bottom: 10px; }
+        .track-name { 
+            width: 60px; flex-shrink: 0; display: flex; align-items: center; 
+            font-weight: bold; font-size: 0.8rem; color: #888;
+        }
+        .steps { display: flex; gap: 4px; flex-grow: 1; }
+        .step {
+            width: 35px; height: 35px; border-radius: 4px; background: #333;
+            display: flex; justify-content: center; align-items: center;
+            font-size: 0.75rem; font-weight: bold; color: #fff;
+            transition: 0.1s;
+        }
+        .step.melody-note { background: #00b894; } /* 멜로디 노트 색상 */
+        .step.chord-note { background: #0984e3; } /* 코드 노트 색상 */
+        .step.playing { transform: scale(1.1); filter: brightness(1.5); outline: 2px solid white; }
+
+        .btn-play {
+            width: 100%; padding: 15px; background: #4facfe; color: white;
+            border: none; border-radius: 8px; font-size: 1.2rem; font-weight: bold;
+            cursor: pointer; transition: 0.2s;
+        }
+        .btn-play.stop { background: #ff7675; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+</head>
+<body>
+
+<div class="container">
+    <h1>🎼 조표 인식 및 멀티트랙 연주 엔진</h1>
+    
+    <div class="controls">
+        <div>
+            <label>악보의 조표 (Key Signature)</label>
+            <select id="keySelect">
+                <option value="C4">다장조 (C Major) - 조표 없음</option>
+                <option value="G3">사장조 (G Major) - # 1개</option>
+                <option value="F3">바장조 (F Major) - ♭ 1개</option>
+                <option value="D4">라장조 (D Major) - # 2개</option>
+            </select>
+        </div>
+        <div>
+            <label>반주 주법 (Accompaniment)</label>
+            <select id="patternSelect">
+                <option value="4beat">4비트 피아노 (단순 정박)</option>
+                <option value="arpeggio">아르페지오 (분산 화음)</option>
+                <option value="calypso">칼립소 (기타 스트로크)</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="sequencer">
+        <div class="track">
+            <div class="track-name">Melody<br>(단음)</div>
+            <div class="steps" id="melodyTrack"></div>
+        </div>
+        <div class="track">
+            <div class="track-name">Chords<br>(반주)</div>
+            <div class="steps" id="chordTrack"></div>
+        </div>
+    </div>
+
+    <button id="playBtn" class="btn-play">▶ 악보 연주 시작</button>
+</div>
+
+<script>
+    /* * [음악 이론 엔진]
+     * 숫자(도수)로 멜로디와 코드를 기록해두면, 
+     * 사용자가 선택한 '조(Key)'에 맞춰 Tone.js가 음정을 자동으로 수학적 계산(Transpose)합니다.
+     */
+
+    // 1. 메이저 스케일의 음정 간격 (반음 기준)
+    const scaleIntervals = { 1: 0, 2: 2, 3: 4, 4: 5, 5: 7, 6: 9, 7: 11 };
+    
+    // 2. 다이아토닉 코드 구성 (근음, 3음, 5음의 음정 간격)
+    const diatonicChords = {
+        'I':  [0, 4, 7],   // Major (도미솔)
+        'ii': [2, 5, 9],   // Minor (레파라)
+        'iii':[4, 7, 11],  // Minor (미솔시)
+        'IV': [5, 9, 12],  // Major (파라도)
+        'V':  [7, 11, 14], // Major (솔시레)
+        'vi': [9, 12, 16]  // Minor (라도미)
+    };
+
+    // 3. 곡 데이터 ("나비야" 앞 4마디 - 8분음표 단위로 쪼갬)
+    // m: 멜로디(음계 도수, null은 쉼표/유지), c: 코드(로마자 표기)
+    const songData = [
+        {m: 5, c: 'I'}, {m: null, c: null}, {m: 3, c: null}, {m: null, c: null}, {m: 3, c: null}, {m: null, c: null}, {m: null, c: null}, {m: null, c: null}, // 솔 미 미 -
+        {m: 4, c: 'V'}, {m: null, c: null}, {m: 2, c: null}, {m: null, c: null}, {m: 2, c: null}, {m: null, c: null}, {m: null, c: null}, {m: null, c: null}, // 파 레 레 -
+        {m: 1, c: 'I'}, {m: null, c: null}, {m: 2, c: null}, {m: null, c: null}, {m: 3, c: 'IV'},{m: null, c: null}, {m: 4, c: null}, {m: null, c: null}, // 도 레 미 파
+        {m: 5, c: 'I'}, {m: null, c: null}, {m: 5, c: null}, {m: null, c: null}, {m: 5, c: null}, {m: null, c: null}, {m: null, c: null}, {m: null, c: null}  // 솔 솔 솔 -
+    ];
+
+    // 4. 주법 패턴 (8비트 단위)
+    const patterns = {
+        '4beat':   [1, 0, 1, 0, 1, 0, 1, 0],
+        'arpeggio':[0, 1, 2, 1, 0, 1, 2, 1],
+        'calypso': [1, 0, 1, 1, 0, 1, 1, 1]
+    };
+
+    // UI 요소
+    const melodyTrackUI = document.getElementById('melodyTrack');
+    const chordTrackUI = document.getElementById('chordTrack');
+    const playBtn = document.getElementById('playBtn');
+    const keySelect = document.getElementById('keySelect');
+    
+    let melodySynth, chordSynth, sequence;
+    let isPlaying = false;
+    let currentChordNotes = [];
+
+    // 시각화 그리기
+    function renderUI() {
+        melodyTrackUI.innerHTML = '';
+        chordTrackUI.innerHTML = '';
+        const rootKey = keySelect.value;
+        const keyName = keySelect.options[keySelect.selectedIndex].text.split(' ')[0];
+
+        songData.forEach((stepData, index) => {
+            // 멜로디 UI
+            const mStep = document.createElement('div');
+            mStep.className = 'step';
+            mStep.id = `m-step-${index}`;
+            if (stepData.m) {
+                mStep.classList.add('melody-note');
+                // 계산된 실제 음이름 표시 (예: G4)
+                mStep.innerText = Tone.Frequency(rootKey).transpose(scaleIntervals[stepData.m]).toNote().replace(/[0-9]/g, '');
+            } else {
+                mStep.innerText = '-';
+            }
+            melodyTrackUI.appendChild(mStep);
+
+            // 코드 UI
+            const cStep = document.createElement('div');
+            cStep.className = 'step';
+            cStep.id = `c-step-${index}`;
+            if (stepData.c) {
+                cStep.classList.add('chord-note');
+                // 로마자를 실제 코드로 변환 표시 (I -> C, V -> G)
+                const rootNoteStr = Tone.Frequency(rootKey).transpose(diatonicChords[stepData.c][0]).toNote().replace(/[0-9]/g, '');
+                const isMinor = ['ii', 'iii', 'vi'].includes(stepData.c);
+                cStep.innerText = rootNoteStr + (isMinor ? 'm' : '');
+            } else {
+                cStep.innerText = '-';
+            }
+            chordTrackUI.appendChild(cStep);
+        });
+    }
+
+    async function togglePlay() {
+        if (!isPlaying) {
+            await Tone.start();
+            
+            // 멜로디용 단음 피아노 신디사이저
+            if(!melodySynth) melodySynth = new Tone.Synth({
+                oscillator: { type: "sine" },
+                envelope: { attack: 0.05, decay: 0.2, sustain: 0.2, release: 1.5 }
+            }).toDestination();
+            
+            // 반주용 다중 화음 신디사이저
+            if(!chordSynth) chordSynth = new Tone.PolySynth(Tone.Synth, {
+                envelope: { attack: 0.02, decay: 0.1, sustain: 0.3, release: 1 }
+            }).toDestination();
+
+            // 멜로디 볼륨을 반주보다 조금 크게
+            melodySynth.volume.value = 2;
+            chordSynth.volume.value = -5;
+            
+            Tone.Transport.bpm.value = 100;
+            const rootKey = keySelect.value;
+            const pattern = patterns[document.getElementById('patternSelect').value];
+            let stepIndex = 0;
+
+            sequence = new Tone.Loop((time) => {
+                const data = songData[stepIndex];
+                
+                // UI 하이라이트
+                document.querySelectorAll('.step').forEach(el => el.classList.remove('playing'));
+                document.getElementById(`m-step-${stepIndex}`).classList.add('playing');
+                document.getElementById(`c-step-${stepIndex}`).classList.add('playing');
+
+                // 1. 멜로디 연주
+                if (data.m !== null) {
+                    const melodyNote = Tone.Frequency(rootKey).transpose(scaleIntervals[data.m]).toNote();
+                    // 한 옥타브 올려서 멜로디 연주
+                    const highMelodyNote = Tone.Frequency(melodyNote).transpose(12).toNote();
+                    melodySynth.triggerAttackRelease(highMelodyNote, "4n", time);
+                }
+
+                // 2. 코드 갱신 (새로운 코드가 나타나면 현재 코드 기억)
+                if (data.c !== null) {
+                    currentChordNotes = diatonicChords[data.c].map(interval => 
+                        Tone.Frequency(rootKey).transpose(interval).toNote()
+                    );
+                }
+
+                // 3. 반주 패턴 연주 (마디 내의 8비트 위치 계산: stepIndex % 8)
+                const patternHit = pattern[stepIndex % 8];
+                if (patternHit !== 0 && currentChordNotes.length > 0) {
+                    const patternType = document.getElementById('patternSelect').value;
+                    if (patternType === 'arpeggio') {
+                        chordSynth.triggerAttackRelease(currentChordNotes[patternHit], "8n", time);
+                    } else {
+                        chordSynth.triggerAttackRelease(currentChordNotes, "8n", time);
+                    }
+                }
+
+                stepIndex = (stepIndex + 1) % songData.length;
+            }, "8n");
+
+            sequence.start(0);
+            Tone.Transport.start();
+            isPlaying = true;
+            playBtn.innerText = "■ 정지";
+            playBtn.classList.add("stop");
+            keySelect.disabled = true;
+            
+        } else {
+            sequence.stop();
+            Tone.Transport.stop();
+            document.querySelectorAll('.step').forEach(el => el.classList.remove('playing'));
+            isPlaying = false;
+            playBtn.innerText = "▶ 악보 연주 시작";
+            playBtn.classList.remove("stop");
+            keySelect.disabled = false;
+        }
+    }
+
+    keySelect.addEventListener('change', renderUI);
+    playBtn.addEventListener('click', togglePlay);
+
+    // 초기화
+    renderUI();
+</script>
+</body>
+</html>
